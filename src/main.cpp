@@ -1,133 +1,153 @@
 /*
-  Dual-Axis Solar Tracker - Arduino Nano ESP32
+  DUAL-AXIS SOLAR TRACKER + POWER LOGGER  -  Arduino Nano ESP32
 
-  Four light sensors (one per corner) sit behind a + shaped wall.
-  The firmware compares left vs right and top vs bottom brightness,
-  then drives two servos until all four read roughly equal, so the
-  head ends up facing the brightest light. As the sun moves, the
-  balance breaks and the tracker re-centers.
+  What this does, in plain terms:
+  Four light sensors sit behind a small plus-shaped wall. The wall casts a
+  shadow, so whichever side faces away from the sun reads darker. Comparing the
+  four readings tells the tracker which way the light is, and two servos turn the
+  panel to face it. While that happens, an INA219 sensor watches the solar
+  panel's output and a colour screen shows the live power and the running total
+  of energy collected.
 
-  Wiring:
-    sensors TL/TR/BL/BR -> A0/A1/A2/A3   (VCC to 3V3 only, not 5V)
-    OLED  SDA->A4  SCL->A5  VCC->3V3  GND->GND
-    pan servo -> D2   tilt servo -> D3   (servo +5V from the MB102)
-    common ground shared across all parts
+  How the pins are used:
+  light sensors  TL / TR / BL / BR  ->  A0 / A1 / A2 / A3   (3.3 V only)
+  pan servo  -> D2        tilt servo -> D3                  (5 V from the MB102)
+  INA219  (I2C)  SDA -> A4   SCL -> A5   VCC -> 3V3   GND -> GND
+  panel current passes through VIN+ and VIN-
+  ST7735 screen (SPI)  SCK -> D13  MOSI -> D11  CS -> D10
+  DC -> D9    RES -> D8    BL -> 3V3
+  one shared ground ties the whole thing together
 */
 
-#include <Wire.h>             // I2C bus for the OLED
-#include <Adafruit_GFX.h>     // graphics primitives
-#include <Adafruit_SSD1306.h> // OLED driver
-#include <ESP32Servo.h>       // ESP32 servo library (not Servo.h)
+#include <Wire.h>            // I2C bus, used by the INA219 power sensor
+#include <SPI.h>             // SPI bus, used by the screen
+#include <Adafruit_GFX.h>    // shared drawing commands (text, shapes)
+#include <Adafruit_ST7735.h> // driver for this exact 1.8" colour screen
+#include <Adafruit_INA219.h> // reads voltage, current and power from the panel
+#include <ESP32Servo.h>      // servo control that works on the ESP32 chip
 
-// Pin assignments - adjust to match the wiring
-const int PIN_TL = A0; // top-left sensor
-const int PIN_TR = A1; // top-right
-const int PIN_BL = A2; // bottom-left
-const int PIN_BR = A3; // bottom-right
+// --- light sensors: top-left, top-right, bottom-left, bottom-right ---
+const int PIN_TL = A0, PIN_TR = A1, PIN_BL = A2, PIN_BR = A3;
 
-const int PAN_PIN = D2;  // pan servo (left/right)
-const int TILT_PIN = D3; // tilt servo (up/down)
+// --- servo signal pins ---
+const int PAN_PIN = D2, TILT_PIN = D3;
 
-// OLED configuration
-#define SCREEN_W 128
-#define SCREEN_H 64    // use 32 for the 128x32 panel
-#define OLED_ADDR 0x3C // try 0x3D if the screen stays blank
-Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
+// --- screen control pins (clock and data are the hardware SPI pins D13/D11) ---
+#define TFT_CS D10 // chip select: tells the screen to listen
+#define TFT_DC D9  // data / command: marks each byte as a value or an order
+#define TFT_RST D8 // reset line
+#define TFT_BL D7  // backlight on/off (a direct wire to 3V3 also works)
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
 
-Servo panServo;
-Servo tiltServo;
+Adafruit_INA219 ina219;    // the power sensor object
+Servo panServo, tiltServo; // the two servo objects
 
-// Tuning constants
-const int DEADZONE = 60;  // ignore imbalances smaller than this
-const int STEP_DEG = 1;   // degrees moved per correction
-const int SETTLE_MS = 20; // pause after each move
-const int ANGLE_MIN = 10; // stay clear of the servo end-stops
-const int ANGLE_MAX = 170;
-const int PAN_DIR = +1;  // set to -1 to reverse pan direction
-const int TILT_DIR = +1; // set to -1 to reverse tilt direction
+// --- behaviour tuning, all in one place for easy changes ---
+const int DEADZONE = 60;                   // how unequal the sides must be before moving (ignores noise)
+const int STEP_DEG = 1;                    // degrees moved per loop, kept small for smooth motion
+const int SETTLE_MS = 20;                  // short pause each loop so the servos can keep up
+const int ANGLE_MIN = 10, ANGLE_MAX = 170; // safe travel limits for both servos
+const int PAN_DIR = +1, TILT_DIR = +1;     // flip a sign here if a servo turns the wrong way
 
-// Current servo positions
-int panAngle = 90;
-int tiltAngle = 90;
+// --- live values the program keeps track of ---
+int panAngle = 90, tiltAngle = 90; // current servo positions, start centred
+int tl, tr, bl, br, hErr, vErr;    // sensor readings and the two error sums
 
-// Sensor readings and the two balance errors
-int tl, tr, bl, br;
-int hErr, vErr;
+// --- power and energy ---
+float busV = 0, current_mA = 0, power_mW = 0; // latest readings from the INA219
+double energy_mWh = 0;                        // running total of energy collected
+unsigned long lastEnergyMs = 0;               // timestamp used to measure each slice
 
-// Forward declarations (defined below)
+// --- screen refresh timing ---
+unsigned long lastDrawMs = 0;
+const unsigned long DRAW_EVERY = 400; // redraw about 2-3 times a second to avoid flicker
+
 void readSensors();
 void updateDisplay();
 
-// Runs once at startup
 void setup()
 {
-  Serial.begin(115200);
-  analogReadResolution(12); // full 0..4095 ADC range
+  Serial.begin(115200);     // opens the USB text channel for debugging
+  analogReadResolution(12); // the ESP32 reads 0-4095 instead of 0-1023
 
-  // Initialize the OLED
-  Wire.begin(); // I2C on A4/A5
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR))
-  {
-    Serial.println("OLED not found - check wiring/address");
-    while (true)
-    {
-    } // halt so the fault is obvious
-  }
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println("Solar Tracker");
-  display.println("starting...");
-  display.display();
-  delay(1000);
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH); // turn the backlight on
 
-  // Initialize the servos
-  ESP32PWM::allocateTimer(0); // reserve the ESP32 PWM timers
+  // start the power sensor on the I2C bus
+  Wire.begin();
+  if (!ina219.begin())
+    Serial.println("INA219 not found - check wiring");
+
+  // wake up the screen, set it to landscape, and show a short splash
+  tft.initR(INITR_BLACKTAB); // colours look wrong? swap for GREENTAB or REDTAB
+  tft.setRotation(3);        // landscape, 160 wide by 128 tall
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setTextSize(2);
+  tft.setCursor(8, 44);
+  tft.print("SOLAR");
+  tft.setCursor(8, 66);
+  tft.print("TRACKER");
+  delay(900);
+
+  // reserve the ESP32 timers the servo library needs, then attach the servos
+  ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
   ESP32PWM::allocateTimer(3);
   panServo.setPeriodHertz(50);
-  tiltServo.setPeriodHertz(50);
+  tiltServo.setPeriodHertz(50); // standard servo rate
   panServo.attach(PAN_PIN, 500, 2400);
   tiltServo.attach(TILT_PIN, 500, 2400);
+  panServo.write(panAngle);
+  tiltServo.write(tiltAngle); // move to the centre
 
-  panServo.write(panAngle); // move to center
-  tiltServo.write(tiltAngle);
-  delay(500);
+  lastEnergyMs = millis(); // mark the starting time for energy counting
+  delay(300);
 }
 
-// Main control loop
 void loop()
 {
+  // 1) read the light and work out which way to turn
   readSensors();
+  hErr = ((tl + bl) / 2) - ((tr + br) / 2); // left brightness minus right brightness
+  vErr = ((tl + tr) / 2) - ((bl + br) / 2); // top brightness minus bottom brightness
 
-  // Convert readings into horizontal/vertical imbalance
-  // (+hErr = left brighter, +vErr = top brighter)
-  hErr = ((tl + bl) / 2) - ((tr + br) / 2);
-  vErr = ((tl + tr) / 2) - ((bl + br) / 2);
-
-  // Move only if the imbalance exceeds the deadzone
+  // nudge each servo one small step toward the brighter side, but only if the
+  // difference is past the deadzone, which stops it twitching in steady light
   if (abs(hErr) > DEADZONE)
-  {
     panAngle += PAN_DIR * ((hErr > 0) ? STEP_DEG : -STEP_DEG);
-  }
   if (abs(vErr) > DEADZONE)
-  {
     tiltAngle += TILT_DIR * ((vErr > 0) ? STEP_DEG : -STEP_DEG);
-  }
 
-  // Clamp to a safe range, then drive the servos
+  // keep both servos inside their safe range and send the new positions
   panAngle = constrain(panAngle, ANGLE_MIN, ANGLE_MAX);
   tiltAngle = constrain(tiltAngle, ANGLE_MIN, ANGLE_MAX);
   panServo.write(panAngle);
   tiltServo.write(tiltAngle);
 
-  updateDisplay();
+  // 2) read the panel, then add this moment's contribution to the energy total
+  busV = ina219.getBusVoltage_V();
+  current_mA = ina219.getCurrent_mA();
+  power_mW = ina219.getPower_mW();
+  if (power_mW < 0)
+    power_mW = 0; // clip tiny negative noise to zero
+  unsigned long now = millis();
+  // energy = power x time; this adds power times the fraction of an hour just elapsed
+  energy_mWh += power_mW * ((now - lastEnergyMs) / 3600000.0);
+  lastEnergyMs = now;
+
+  // 3) refresh the screen on a timer so it stays readable instead of flickering
+  if (now - lastDrawMs >= DRAW_EVERY)
+  {
+    updateDisplay();
+    lastDrawMs = now;
+  }
+
   delay(SETTLE_MS);
 }
 
-// Read all four sensors (0 = dark, 4095 = bright)
+// grabs all four light readings in one place
 void readSensors()
 {
   tl = analogRead(PIN_TL);
@@ -136,28 +156,56 @@ void readSensors()
   br = analogRead(PIN_BR);
 }
 
-// Show live readings, errors, and angles on the OLED
+// paints the whole screen: title, live power, total energy, voltage, and status
 void updateDisplay()
 {
-  display.clearDisplay();
-  display.setCursor(0, 0);
+  tft.fillScreen(ST77XX_BLACK);
 
-  display.print("TL ");
-  display.print(tl);
-  display.print("  TR ");
-  display.println(tr);
-  display.print("BL ");
-  display.print(bl);
-  display.print("  BR ");
-  display.println(br);
-  display.print("Herr ");
-  display.println(hErr);
-  display.print("Verr ");
-  display.println(vErr);
-  display.print("Pan ");
-  display.print(panAngle);
-  display.print(" Tilt ");
-  display.println(tiltAngle);
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(4, 4);
+  tft.print("SOLAR TRK");
 
-  display.display();
+  tft.setTextSize(1);
+  int y = 34;
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(4, y);
+  tft.print("Power now:");
+  tft.setTextColor(ST77XX_GREEN);
+  tft.setCursor(86, y);
+  tft.print(power_mW, 1);
+  tft.print(" mW");
+  y += 16;
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(4, y);
+  tft.print("Energy:");
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(86, y);
+  tft.print(energy_mWh, 3);
+  tft.print(" mWh");
+  y += 16;
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(4, y);
+  tft.print("Voltage:");
+  tft.setCursor(86, y);
+  tft.print(busV, 2);
+  tft.print(" V");
+  y += 22;
+  tft.setTextColor(0xFD20);
+  tft.setCursor(4, y); // orange for the mechanics
+  tft.print("Pan ");
+  tft.print(panAngle);
+  tft.print("  Tilt ");
+  tft.print(tiltAngle);
+  y += 16;
+  tft.setTextColor(0x7BEF);
+  tft.setCursor(4, y); // grey for the raw numbers
+  tft.print("L ");
+  tft.print(tl);
+  tft.print(" ");
+  tft.print(tr);
+  tft.print(" ");
+  tft.print(bl);
+  tft.print(" ");
+  tft.print(br);
 }
