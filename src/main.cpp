@@ -1,211 +1,524 @@
 /*
-  DUAL-AXIS SOLAR TRACKER + POWER LOGGER  -  Arduino Nano ESP32
+  DUAL-AXIS SOLAR TRACKER + POWER LOGGER + WIFI CONTROL PANEL  -  Arduino Nano ESP32
 
-  What this does, in plain terms:
-  Four light sensors sit behind a small plus-shaped wall. The wall casts a
-  shadow, so whichever side faces away from the sun reads darker. Comparing the
-  four readings tells the tracker which way the light is, and two servos turn the
-  panel to face it. While that happens, an INA219 sensor watches the solar
-  panel's output and a colour screen shows the live power and the running total
-  of energy collected.
+  Plain summary:
+  Four light sensors steer two servos to face the sun. An INA219 watches the panel.
+  The colour screen shows a live status board. The ESP32 hosts its own WiFi network
+  and serves a phone dashboard that not only displays everything but also CONTROLS the
+  tracker: pick a mode (Auto / Fixed / Manual), drive the servos by hand, retune the
+  tracker live, and reset the comparison - all wirelessly.
 
-  How the pins are used:
-  light sensors  TL / TR / BL / BR  ->  A0 / A1 / A2 / A3   (3.3 V only)
-  pan servo  -> D2        tilt servo -> D3                  (5 V from the MB102)
-  INA219  (I2C)  SDA -> A4   SCL -> A5   VCC -> 3V3   GND -> GND
-  panel current passes through VIN+ and VIN-
-  ST7735 screen (SPI)  SCK -> D13  MOSI -> D11  CS -> D10
-  DC -> D9    RES -> D8    BL -> 3V3
-  one shared ground ties the whole thing together
+  Wiring (unchanged):
+    sensors TL/TR/BL/BR -> A0/A1/A2/A3   (3.3 V)
+    pan -> D2   tilt -> D3               (5 V from MB102)
+    INA219 SDA->A4 SCL->A5
+    ST7735 SCK->D13 MOSI->D11 CS->D10 DC->D9 RES->D8 BL->3V3
+
+  WiFi: connect a phone to network "SolarTracker" (password track1234),
+  then open  http://192.168.4.1
 */
 
-#include <Wire.h>            // I2C bus, used by the INA219 power sensor
-#include <SPI.h>             // SPI bus, used by the screen
-#include <Adafruit_GFX.h>    // shared drawing commands (text, shapes)
-#include <Adafruit_ST7735.h> // driver for this exact 1.8" colour screen
-#include <Adafruit_INA219.h> // reads voltage, current and power from the panel
-#include <ESP32Servo.h>      // servo control that works on the ESP32 chip
+#include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <Adafruit_INA219.h>
+#include <ESP32Servo.h>
+#include <WiFi.h>
+#include <WebServer.h>
 
-// --- light sensors: top-left, top-right, bottom-left, bottom-right ---
 const int PIN_TL = A0, PIN_TR = A1, PIN_BL = A2, PIN_BR = A3;
-
-// --- servo signal pins ---
 const int PAN_PIN = D2, TILT_PIN = D3;
-
-// --- screen control pins (clock and data are the hardware SPI pins D13/D11) ---
-#define TFT_CS D10 // chip select: tells the screen to listen
-#define TFT_DC D9  // data / command: marks each byte as a value or an order
-#define TFT_RST D8 // reset line
-#define TFT_BL D7  // backlight on/off (a direct wire to 3V3 also works)
+#define TFT_CS D10
+#define TFT_DC D9
+#define TFT_RST D8
+#define TFT_BL D7
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+Adafruit_INA219 ina219;
+Servo panServo, tiltServo;
 
-Adafruit_INA219 ina219;    // the power sensor object
-Servo panServo, tiltServo; // the two servo objects
+const char *AP_SSID = "SolarTracker";
+const char *AP_PASS = "track1234";
+WebServer server(80);
 
-// --- behaviour tuning, all in one place for easy changes ---
-const int DEADZONE = 60;                   // how unequal the sides must be before moving (ignores noise)
-const int STEP_DEG = 1;                    // degrees moved per loop, kept small for smooth motion
-const int SETTLE_MS = 20;                  // short pause each loop so the servos can keep up
-const int ANGLE_MIN = 10, ANGLE_MAX = 170; // safe travel limits for both servos
-const int PAN_DIR = +1, TILT_DIR = +1;     // flip a sign here if a servo turns the wrong way
+// --- fixed limits and pacing ---
+const int SETTLE_MS = 20, ANGLE_MIN = 10, ANGLE_MAX = 170, PAN_DIR = +1, TILT_DIR = +1;
+const int STALL_CYCLES = 40, PARK_PAN = ANGLE_MIN, PARK_TILT = 60;
+const unsigned long DRAW_EVERY = 400;
 
-// --- live values the program keeps track of ---
-int panAngle = 90, tiltAngle = 90; // current servo positions, start centred
-int tl, tr, bl, br, hErr, vErr;    // sensor readings and the two error sums
+// --- dials the phone can change while running (start values) ---
+int deadzone = 60;   // how lopsided the light must be before moving
+int stepDeg = 1;     // degrees per nudge
+int darkLevel = 350; // average reading below this counts as night
+int smoothPct = 30;  // sensor smoothing, percent (lower = calmer)
+int fixedPan = 90;   // the flat hold angles used in the Fixed test
+int fixedTilt = 90;
 
-// --- power and energy ---
-float busV = 0, current_mA = 0, power_mW = 0; // latest readings from the INA219
-double energy_mWh = 0;                        // running total of energy collected
-unsigned long lastEnergyMs = 0;               // timestamp used to measure each slice
+// --- modes the user can pick from the phone ---
+enum Mode
+{
+  AUTO,
+  FIXEDMODE,
+  MANUAL
+};
+Mode mode = AUTO;
+int manualPan = 90, manualTilt = 90; // angles set by the phone in Manual mode
+bool isNight = false;
+const char *stateLabel = "TRACKING";
 
-// --- screen refresh timing ---
-unsigned long lastDrawMs = 0;
-const unsigned long DRAW_EVERY = 400; // redraw about 2-3 times a second to avoid flicker
+// --- live values ---
+int panAngle = 90, tiltAngle = 90;
+int rawTL, rawTR, rawBL, rawBR;
+float tl = 0, tr = 0, bl = 0, br = 0;
+int hErr, vErr, panStall = 0, tiltStall = 0;
+bool panStalled = false, tiltStalled = false;
+
+// --- power and the two comparison buckets ---
+float busV = 0, current_mA = 0, power_mW = 0;
+double energyTrack_mWh = 0, energyFixed_mWh = 0, msTrack = 0, msFixed = 0;
+unsigned long lastEnergyMs = 0, lastDrawMs = 0;
 
 void readSensors();
 void updateDisplay();
+uint16_t stateColor();
+float gainPct();
+const char *modeName();
+void handleRoot();
+void handleData();
+void handleMode();
+void handleMove();
+void handleSet();
+void handleReset();
+
+// the control-panel page, stored in the chip so it needs no internet
+const char PAGE[] = R"HTML(
+<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>Solar Tracker</title>
+<style>
+*{box-sizing:border-box}body{font-family:system-ui,Segoe UI,Roboto,sans-serif;
+background:linear-gradient(160deg,#0a0e15,#0f1722);color:#e6eef7;margin:0 auto;padding:18px;max-width:560px}
+h1{font-size:20px;margin:0;display:flex;align-items:center;gap:8px}
+.sub{color:#6f8398;font-size:12px;margin:2px 0 14px}
+.badge{font-size:12px;font-weight:800;padding:4px 10px;border-radius:20px;color:#06222a}
+.card{background:#121b27;border:1px solid #1e2c3c;border-radius:14px;padding:16px;margin:12px 0;box-shadow:0 4px 14px rgba(0,0,0,.25)}
+.label{color:#7d92a6;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+.big{font-size:40px;font-weight:800;color:#39d98a;line-height:1.1}.unit{font-size:16px;color:#7d92a6;font-weight:600}
+.gain{font-size:30px;font-weight:800;color:#f5b301}
+.row{display:flex;justify-content:space-between;align-items:center;margin:7px 0;font-size:14px}.k{color:#7d92a6}.v{font-weight:600}
+canvas{width:100%;height:90px;display:block;margin-top:10px}
+.modes{display:flex;gap:8px}.modes button{flex:1;padding:11px;border:1px solid #27384b;border-radius:10px;background:#16212f;color:#cfe0f0;font-weight:700;font-size:14px}
+.modes button.on{background:#39d98a;color:#06222a;border-color:#39d98a}
+.slider{margin:12px 0}.slider .top{display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px}
+input[type=range]{width:100%;accent-color:#39d98a}
+.btn{width:100%;padding:12px;border:0;border-radius:10px;background:#27384b;color:#cfe0f0;font-weight:700;font-size:14px;margin-top:6px}
+.hide{display:none}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px}
+.stat{background:#0e1722;border:1px solid #1c2a3a;border-radius:10px;padding:10px}.stat .n{font-size:18px;font-weight:700}
+</style></head><body>
+<h1>&#9728;&#65039; Solar Tracker <span id=badge class=badge>--</span></h1>
+<div class=sub>live control panel &middot; 192.168.4.1</div>
+
+<div class=card><div class=label>Power now</div>
+<div class=big id=power>--<span class=unit> mW</span></div>
+<canvas id=spark width=520 height=90></canvas></div>
+
+<div class=card>
+<div class=modes>
+<button id=mAuto onclick="setMode('auto')">Auto</button>
+<button id=mFixed onclick="setMode('fixed')">Fixed</button>
+<button id=mManual onclick="setMode('manual')">Manual</button></div>
+<div id=manual class=hide>
+<div class=slider><div class=top><span class=k>Pan</span><span id=mpL>90&deg;</span></div>
+<input type=range id=mp min=10 max=170 value=90 oninput="move()"></div>
+<div class=slider><div class=top><span class=k>Tilt</span><span id=mtL>90&deg;</span></div>
+<input type=range id=mt min=10 max=170 value=90 oninput="move()"></div></div></div>
+
+<div class=card><div class=label>Tracking vs Fixed</div>
+<div class=gain id=gain>--</div>
+<div class=grid>
+<div class=stat><div class=k>Track avg</div><div class=n id=pT>--</div></div>
+<div class=stat><div class=k>Fixed avg</div><div class=n id=pF>--</div></div>
+<div class=stat><div class=k>Energy track</div><div class=n id=eT>--</div></div>
+<div class=stat><div class=k>Energy fixed</div><div class=n id=eF>--</div></div></div>
+<button class=btn onclick="reset()">Reset comparison</button></div>
+
+<div class=card>
+<div class=row><span class=k>State</span><span class=v id=state>--</span></div>
+<div class=row><span class=k>Voltage</span><span class=v id=volts>--</span></div>
+<div class=row><span class=k>Pan / Tilt</span><span class=v id=ang>--</span></div>
+<div class=row><span class=k>Sensors TL TR BL BR</span><span class=v id=sens>--</span></div></div>
+
+<div class=card><div class=label>Tuning (live)</div>
+<div class=slider><div class=top><span class=k>Deadzone</span><span id=dzL>--</span></div>
+<input type=range id=dz min=5 max=300 oninput="setv('deadzone','dz','dzL','')"></div>
+<div class=slider><div class=top><span class=k>Step size</span><span id=stL>--</span></div>
+<input type=range id=st min=1 max=5 oninput="setv('step','st','stL','')"></div>
+<div class=slider><div class=top><span class=k>Smoothing</span><span id=smL>--</span></div>
+<input type=range id=sm min=5 max=90 oninput="setv('smooth','sm','smL','%')"></div>
+<div class=slider><div class=top><span class=k>Night level</span><span id=dkL>--</span></div>
+<input type=range id=dk min=0 max=2000 oninput="setv('dark','dk','dkL','')"></div>
+<div class=slider><div class=top><span class=k>Fixed pan</span><span id=fpL>--</span></div>
+<input type=range id=fp min=10 max=170 oninput="setv('fpan','fp','fpL','&deg;')"></div>
+<div class=slider><div class=top><span class=k>Fixed tilt</span><span id=ftL>--</span></div>
+<input type=range id=ft min=10 max=170 oninput="setv('ftilt','ft','ftL','&deg;')"></div></div>
+
+<script>
+let hist=[],first=true,last={},$=id=>document.getElementById(id);
+const bc={TRACKING:'#39d98a',NIGHT:'#6aa6ff',FIXED:'#f5b301',MANUAL:'#ff7ac6'};
+async function tick(){try{
+let d=await(await fetch('/data')).json();last=d;
+$('power').innerHTML=d.power.toFixed(1)+'<span class=unit> mW</span>';
+$('badge').textContent=d.state;$('badge').style.background=bc[d.state]||'#7d92a6';
+$('gain').textContent=(d.gain>=0?'+':'')+d.gain.toFixed(1)+'%';
+$('pT').textContent=d.pTrack.toFixed(1)+' mW';$('pF').textContent=d.pFixed.toFixed(1)+' mW';
+$('eT').textContent=d.eTrack.toFixed(2)+' mWh';$('eF').textContent=d.eFixed.toFixed(2)+' mWh';
+$('state').textContent=d.state+(d.stall?'  (stall)':'');
+$('volts').textContent=d.volts.toFixed(2)+' V';$('ang').textContent=d.pan+'\u00b0 / '+d.tilt+'\u00b0';
+$('sens').textContent=d.s.join('  ');
+['mAuto','mFixed','mManual'].forEach(x=>$(x).classList.remove('on'));
+$({auto:'mAuto',fixed:'mFixed',manual:'mManual'}[d.mode]).classList.add('on');
+$('manual').classList.toggle('hide',d.mode!='manual');
+if(first){
+ $('dz').value=d.deadzone;$('dzL').textContent=d.deadzone;
+ $('st').value=d.step;$('stL').textContent=d.step;
+ $('sm').value=d.smooth;$('smL').textContent=d.smooth+'%';
+ $('dk').value=d.dark;$('dkL').textContent=d.dark;
+ $('fp').value=d.fpan;$('fpL').innerHTML=d.fpan+'&deg;';
+ $('ft').value=d.ftilt;$('ftL').innerHTML=d.ftilt+'&deg;';
+ first=false;}
+hist.push(d.power);if(hist.length>120)hist.shift();draw();
+}catch(e){}}
+function draw(){let c=$('spark'),x=c.getContext('2d'),w=c.width,h=c.height;
+x.clearRect(0,0,w,h);let m=Math.max(1,...hist);x.strokeStyle='#39d98a';x.lineWidth=2;x.beginPath();
+hist.forEach((v,i)=>{let px=i/119*w,py=h-(v/m)*(h-8)-4;i?x.lineTo(px,py):x.moveTo(px,py);});x.stroke();}
+function setMode(m){fetch('/mode?m='+m);
+ if(m=='manual'&&last.pan!=null){$('mp').value=last.pan;$('mt').value=last.tilt;
+  $('mpL').innerHTML=last.pan+'&deg;';$('mtL').innerHTML=last.tilt+'&deg;';}}
+function move(){let p=$('mp').value,t=$('mt').value;
+ $('mpL').innerHTML=p+'&deg;';$('mtL').innerHTML=t+'&deg;';fetch('/move?pan='+p+'&tilt='+t);}
+function setv(key,sid,lid,suf){let v=$(sid).value;$(lid).innerHTML=v+suf;fetch('/set?k='+key+'&v='+v);}
+function reset(){fetch('/reset');}
+setInterval(tick,1000);tick();
+</script></body></html>
+)HTML";
 
 void setup()
 {
-  Serial.begin(115200);     // opens the USB text channel for debugging
-  analogReadResolution(12); // the ESP32 reads 0-4095 instead of 0-1023
-
+  Serial.begin(115200);
+  analogReadResolution(12);
   pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH); // turn the backlight on
-
-  // start the power sensor on the I2C bus
+  digitalWrite(TFT_BL, HIGH);
   Wire.begin();
   if (!ina219.begin())
-    Serial.println("INA219 not found - check wiring");
-
-  // wake up the screen, set it to landscape, and show a short splash
-  tft.initR(INITR_BLACKTAB); // colours look wrong? swap for GREENTAB or REDTAB
-  tft.setRotation(3);        // landscape, 160 wide by 128 tall
+    Serial.println("INA219 not found");
+  tft.initR(INITR_BLACKTAB);
+  tft.setRotation(3);
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextColor(ST77XX_YELLOW);
   tft.setTextSize(2);
-  tft.setCursor(8, 44);
+  tft.setCursor(8, 28);
   tft.print("SOLAR");
-  tft.setCursor(8, 66);
-  tft.print("TRACKER");
-  delay(900);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(8, 56);
+  tft.print("WiFi: ");
+  tft.print(AP_SSID);
+  tft.setCursor(8, 70);
+  tft.print("http://192.168.4.1");
 
-  // reserve the ESP32 timers the servo library needs, then attach the servos
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
   ESP32PWM::allocateTimer(3);
   panServo.setPeriodHertz(50);
-  tiltServo.setPeriodHertz(50); // standard servo rate
+  tiltServo.setPeriodHertz(50);
   panServo.attach(PAN_PIN, 500, 2400);
   tiltServo.attach(TILT_PIN, 500, 2400);
   panServo.write(panAngle);
-  tiltServo.write(tiltAngle); // move to the centre
+  tiltServo.write(tiltAngle);
 
-  lastEnergyMs = millis(); // mark the starting time for energy counting
-  delay(300);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/mode", handleMode);   // Auto / Fixed / Manual buttons
+  server.on("/move", handleMove);   // manual pan/tilt sliders
+  server.on("/set", handleSet);     // live tuning sliders
+  server.on("/reset", handleReset); // clear the comparison
+  server.begin();
+
+  lastEnergyMs = millis();
+  delay(1200);
 }
 
 void loop()
 {
-  // 1) read the light and work out which way to turn
   readSensors();
-  hErr = ((tl + bl) / 2) - ((tr + br) / 2); // left brightness minus right brightness
-  vErr = ((tl + tr) / 2) - ((bl + br) / 2); // top brightness minus bottom brightness
+  float avg = (tl + tr + bl + br) / 4.0;
 
-  // nudge each servo one small step toward the brighter side, but only if the
-  // difference is past the deadzone, which stops it twitching in steady light
-  if (abs(hErr) > DEADZONE)
-    panAngle += PAN_DIR * ((hErr > 0) ? STEP_DEG : -STEP_DEG);
-  if (abs(vErr) > DEADZONE)
-    tiltAngle += TILT_DIR * ((vErr > 0) ? STEP_DEG : -STEP_DEG);
-
-  // keep both servos inside their safe range and send the new positions
-  panAngle = constrain(panAngle, ANGLE_MIN, ANGLE_MAX);
-  tiltAngle = constrain(tiltAngle, ANGLE_MIN, ANGLE_MAX);
-  panServo.write(panAngle);
-  tiltServo.write(tiltAngle);
-
-  // 2) read the panel, then add this moment's contribution to the energy total
   busV = ina219.getBusVoltage_V();
   current_mA = ina219.getCurrent_mA();
   power_mW = ina219.getPower_mW();
   if (power_mW < 0)
-    power_mW = 0; // clip tiny negative noise to zero
-  unsigned long now = millis();
-  // energy = power x time; this adds power times the fraction of an hour just elapsed
-  energy_mWh += power_mW * ((now - lastEnergyMs) / 3600000.0);
-  lastEnergyMs = now;
+    power_mW = 0;
 
-  // 3) refresh the screen on a timer so it stays readable instead of flickering
+  unsigned long now = millis();
+  double dms = now - lastEnergyMs;
+  lastEnergyMs = now;
+  // bank energy only in the two comparison modes (manual is excluded)
+  if (mode == AUTO)
+  {
+    energyTrack_mWh += power_mW * (dms / 3600000.0);
+    msTrack += dms;
+  }
+  else if (mode == FIXEDMODE)
+  {
+    energyFixed_mWh += power_mW * (dms / 3600000.0);
+    msFixed += dms;
+  }
+
+  isNight = false;
+  if (mode == MANUAL)
+  {
+    panAngle = manualPan;
+    tiltAngle = manualTilt;
+    stateLabel = "MANUAL";
+    panStalled = tiltStalled = false;
+  }
+  else if (mode == FIXEDMODE)
+  {
+    panAngle = fixedPan;
+    tiltAngle = fixedTilt;
+    stateLabel = "FIXED";
+    panStalled = tiltStalled = false;
+  }
+  else
+  { // AUTO
+    if (avg < darkLevel)
+    {
+      panAngle = PARK_PAN;
+      tiltAngle = PARK_TILT;
+      stateLabel = "NIGHT";
+      isNight = true;
+      panStalled = tiltStalled = false;
+    }
+    else
+    {
+      stateLabel = "TRACKING";
+      hErr = ((tl + bl) / 2) - ((tr + br) / 2);
+      vErr = ((tl + tr) / 2) - ((bl + br) / 2);
+      int panNudge = (abs(hErr) > deadzone) ? PAN_DIR * ((hErr > 0) ? stepDeg : -stepDeg) : 0;
+      int tiltNudge = (abs(vErr) > deadzone) ? TILT_DIR * ((vErr > 0) ? stepDeg : -stepDeg) : 0;
+      if ((panAngle >= ANGLE_MAX && panNudge > 0) || (panAngle <= ANGLE_MIN && panNudge < 0))
+      {
+        if (++panStall > STALL_CYCLES)
+          panStalled = true;
+        panNudge = 0;
+      }
+      else
+      {
+        panStall = 0;
+        panStalled = false;
+      }
+      if ((tiltAngle >= ANGLE_MAX && tiltNudge > 0) || (tiltAngle <= ANGLE_MIN && tiltNudge < 0))
+      {
+        if (++tiltStall > STALL_CYCLES)
+          tiltStalled = true;
+        tiltNudge = 0;
+      }
+      else
+      {
+        tiltStall = 0;
+        tiltStalled = false;
+      }
+      panAngle = constrain(panAngle + panNudge, ANGLE_MIN, ANGLE_MAX);
+      tiltAngle = constrain(tiltAngle + tiltNudge, ANGLE_MIN, ANGLE_MAX);
+    }
+  }
+
+  panServo.write(panAngle);
+  tiltServo.write(tiltAngle);
+
   if (now - lastDrawMs >= DRAW_EVERY)
   {
     updateDisplay();
     lastDrawMs = now;
   }
-
+  server.handleClient();
   delay(SETTLE_MS);
 }
 
-// grabs all four light readings in one place
 void readSensors()
 {
-  tl = analogRead(PIN_TL);
-  tr = analogRead(PIN_TR);
-  bl = analogRead(PIN_BL);
-  br = analogRead(PIN_BR);
+  rawTL = analogRead(PIN_TL);
+  rawTR = analogRead(PIN_TR);
+  rawBL = analogRead(PIN_BL);
+  rawBR = analogRead(PIN_BR);
+  float a = smoothPct / 100.0;
+  tl += (rawTL - tl) * a;
+  tr += (rawTR - tr) * a;
+  bl += (rawBL - bl) * a;
+  br += (rawBR - br) * a;
 }
 
-// paints the whole screen: title, live power, total energy, voltage, and status
+uint16_t stateColor()
+{
+  if (mode == MANUAL)
+    return 0xFB56; // pink
+  if (mode == FIXEDMODE)
+    return 0xFD20; // amber
+  if (isNight)
+    return 0x5BDF; // blue
+  return 0x07E0;   // green = tracking
+}
+const char *modeName() { return mode == AUTO ? "auto" : mode == FIXEDMODE ? "fixed"
+                                                                          : "manual"; }
+
+float gainPct()
+{
+  double hT = msTrack / 3600000.0, hF = msFixed / 3600000.0;
+  double pT = hT > 0 ? energyTrack_mWh / hT : 0;
+  double pF = hF > 0 ? energyFixed_mWh / hF : 0;
+  return pF > 0 ? (float)((pT - pF) / pF * 100.0) : 0;
+}
+
 void updateDisplay()
 {
+  uint16_t col = stateColor();
   tft.fillScreen(ST77XX_BLACK);
-
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_YELLOW);
-  tft.setCursor(4, 4);
-  tft.print("SOLAR TRK");
-
+  tft.setCursor(4, 2);
+  tft.print("SOLAR");
+  tft.fillRoundRect(92, 2, 64, 16, 3, col);
   tft.setTextSize(1);
-  int y = 34;
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(4, y);
-  tft.print("Power now:");
-  tft.setTextColor(ST77XX_GREEN);
-  tft.setCursor(86, y);
-  tft.print(power_mW, 1);
-  tft.print(" mW");
-  y += 16;
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(4, y);
-  tft.print("Energy:");
-  tft.setTextColor(ST77XX_CYAN);
-  tft.setCursor(86, y);
-  tft.print(energy_mWh, 3);
-  tft.print(" mWh");
-  y += 16;
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(4, y);
-  tft.print("Voltage:");
-  tft.setCursor(86, y);
-  tft.print(busV, 2);
-  tft.print(" V");
-  y += 22;
-  tft.setTextColor(0xFD20);
-  tft.setCursor(4, y); // orange for the mechanics
-  tft.print("Pan ");
-  tft.print(panAngle);
-  tft.print("  Tilt ");
-  tft.print(tiltAngle);
-  y += 16;
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setCursor(97, 6);
+  tft.print(stateLabel);
+
   tft.setTextColor(0x7BEF);
-  tft.setCursor(4, y); // grey for the raw numbers
-  tft.print("L ");
-  tft.print(tl);
-  tft.print(" ");
-  tft.print(tr);
-  tft.print(" ");
-  tft.print(bl);
-  tft.print(" ");
-  tft.print(br);
+  tft.setCursor(4, 26);
+  tft.print("POWER");
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_GREEN);
+  tft.setCursor(4, 36);
+  tft.print(power_mW, 1);
+  tft.setTextSize(1);
+  tft.print(" mW");
+
+  int y = 60;
+  tft.setTextColor(0x7BEF);
+  tft.setCursor(4, y);
+  tft.print("Volt");
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(40, y);
+  tft.print(busV, 2);
+  tft.print("V");
+  tft.setTextColor(0x7BEF);
+  tft.setCursor(92, y);
+  tft.print("P/T");
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(116, y);
+  tft.print(panAngle);
+  tft.print("/");
+  tft.print(tiltAngle);
+
+  y = 80;
+  tft.setTextColor(0x7BEF);
+  tft.setCursor(4, y);
+  tft.print("E trk");
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(46, y);
+  tft.print(energyTrack_mWh, 2);
+  tft.setTextColor(0x7BEF);
+  tft.setCursor(4, y + 12);
+  tft.print("E fix");
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(46, y + 12);
+  tft.print(energyFixed_mWh, 2);
+  tft.setTextColor(0x7BEF);
+  tft.setCursor(4, y + 24);
+  tft.print("Gain");
+  tft.setTextColor(0xFD20);
+  tft.setCursor(46, y + 24);
+  tft.print(gainPct(), 1);
+  tft.print("%");
+
+  tft.setTextColor(0x5BDF);
+  tft.setCursor(4, 120);
+  tft.print("WiFi ");
+  tft.print(AP_SSID);
+  tft.print(" .4.1");
+}
+
+// --- web handlers ---
+void handleRoot() { server.send(200, "text/html", PAGE); }
+
+void handleData()
+{
+  double hT = msTrack / 3600000.0, hF = msFixed / 3600000.0;
+  double pT = hT > 0 ? energyTrack_mWh / hT : 0;
+  double pF = hF > 0 ? energyFixed_mWh / hF : 0;
+  char buf[620];
+  snprintf(buf, sizeof(buf),
+           "{\"power\":%.1f,\"volts\":%.2f,\"pan\":%d,\"tilt\":%d,"
+           "\"eTrack\":%.3f,\"eFixed\":%.3f,\"pTrack\":%.1f,\"pFixed\":%.1f,\"gain\":%.1f,"
+           "\"s\":[%d,%d,%d,%d],\"state\":\"%s\",\"mode\":\"%s\",\"stall\":%s,"
+           "\"deadzone\":%d,\"step\":%d,\"smooth\":%d,\"dark\":%d,\"fpan\":%d,\"ftilt\":%d}",
+           power_mW, busV, panAngle, tiltAngle, energyTrack_mWh, energyFixed_mWh, pT, pF, gainPct(),
+           rawTL, rawTR, rawBL, rawBR, stateLabel, modeName(),
+           (panStalled || tiltStalled) ? "true" : "false",
+           deadzone, stepDeg, smoothPct, darkLevel, fixedPan, fixedTilt);
+  server.send(200, "application/json", buf);
+}
+
+void handleMode()
+{
+  String m = server.arg("m");
+  if (m == "auto")
+    mode = AUTO;
+  else if (m == "fixed")
+    mode = FIXEDMODE;
+  else if (m == "manual")
+  {
+    mode = MANUAL;
+    manualPan = panAngle;
+    manualTilt = tiltAngle;
+  }
+  server.send(200, "text/plain", "ok");
+}
+
+void handleMove()
+{
+  if (server.hasArg("pan"))
+    manualPan = constrain(server.arg("pan").toInt(), ANGLE_MIN, ANGLE_MAX);
+  if (server.hasArg("tilt"))
+    manualTilt = constrain(server.arg("tilt").toInt(), ANGLE_MIN, ANGLE_MAX);
+  server.send(200, "text/plain", "ok");
+}
+
+void handleSet()
+{
+  String k = server.arg("k");
+  int v = server.arg("v").toInt();
+  if (k == "deadzone")
+    deadzone = constrain(v, 5, 300);
+  else if (k == "step")
+    stepDeg = constrain(v, 1, 5);
+  else if (k == "smooth")
+    smoothPct = constrain(v, 5, 90);
+  else if (k == "dark")
+    darkLevel = constrain(v, 0, 2000);
+  else if (k == "fpan")
+    fixedPan = constrain(v, ANGLE_MIN, ANGLE_MAX);
+  else if (k == "ftilt")
+    fixedTilt = constrain(v, ANGLE_MIN, ANGLE_MAX);
+  server.send(200, "text/plain", "ok");
+}
+
+void handleReset()
+{
+  energyTrack_mWh = 0;
+  energyFixed_mWh = 0;
+  msTrack = 0;
+  msFixed = 0;
+  server.send(200, "text/plain", "ok");
 }
