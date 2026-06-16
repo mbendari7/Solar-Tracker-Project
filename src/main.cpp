@@ -1,23 +1,26 @@
 /*
-  DUAL-AXIS SOLAR TRACKER + POWER LOGGER + WIFI CONTROL PANEL  -  Arduino Nano ESP32
+  DUAL-AXIS SOLAR TRACKER + POWER LOGGER + WIFI CONTROL PANEL
+  Arduino Nano ESP32
 
-  Plain summary:
-  Four light sensors steer two servos to face the sun. An INA219 watches the panel.
-  The colour screen shows a live status board. The ESP32 hosts its own WiFi network
-  and serves a phone dashboard that not only displays everything but also CONTROLS the
-  tracker: pick a mode (Auto / Fixed / Manual), drive the servos by hand, retune the
-  tracker live, and reset the comparison - all wirelessly.
+  Overview:
+  Four light sensors behind a "+" shade wall detect which side the sun is on; two
+  servos rotate the panel until the readings balance. An INA219 measures the panel's
+  output power. A colour TFT shows a live status board. The ESP32 hosts its own WiFi
+  network and serves a web dashboard that both displays the data and controls the
+  tracker (mode selection, manual servo control, and live tuning).
 
-  Wiring (unchanged):
-    sensors TL/TR/BL/BR -> A0/A1/A2/A3   (3.3 V)
-    pan -> D2   tilt -> D3               (5 V from MB102)
-    INA219 SDA->A4 SCL->A5
-    ST7735 SCK->D13 MOSI->D11 CS->D10 DC->D9 RES->D8 BL->3V3
+  Wiring:
+    sensors TL/TR/BL/BR -> A0/A1/A2/A3   (3.3 V reference)
+    pan servo -> D2   tilt servo -> D3   (5 V supply, common ground)
+    INA219  SDA -> A4   SCL -> A5         (I2C)
+    ST7735  SCK -> D13  MOSI -> D11  CS -> D10  DC -> D9  RES -> D8  BL -> 3V3  (SPI)
 
-  WiFi: connect a phone to network "SolarTracker" (password track1234),
-  then open  http://192.168.4.1
+  Access: connect to WiFi network "SolarTracker" (password track1234),
+  then open http://192.168.4.1
 */
 
+// Hardware and networking libraries. WiFi and WebServer are part of the ESP32 core
+// and require no separate installation.
 #include <Wire.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
@@ -27,34 +30,45 @@
 #include <WiFi.h>
 #include <WebServer.h>
 
+// Light sensors on analog pins A0-A3, mapped to the panel corners.
 const int PIN_TL = A0, PIN_TR = A1, PIN_BL = A2, PIN_BR = A3;
+// Servo signal pins: pan (left/right) and tilt (up/down).
 const int PAN_PIN = D2, TILT_PIN = D3;
+// TFT control pins. Clock and data use the hardware SPI pins (D13/D11).
 #define TFT_CS D10
 #define TFT_DC D9
 #define TFT_RST D8
 #define TFT_BL D7
+
+// Hardware interface objects for the display, power sensor, and two servos.
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
 Adafruit_INA219 ina219;
 Servo panServo, tiltServo;
 
+// Access-point credentials. The device creates its own network, so no router or
+// internet connection is needed. WPA2 requires a password of at least 8 characters.
 const char *AP_SSID = "SolarTracker";
 const char *AP_PASS = "track1234";
+// Web server on port 80 (the default HTTP port, so no port is needed in the URL).
 WebServer server(80);
 
-// --- fixed limits and pacing ---
+// Fixed operating limits: loop pacing, safe servo angle range, axis direction signs,
+// stall threshold, overnight park position, and screen refresh interval.
 const int SETTLE_MS = 20, ANGLE_MIN = 10, ANGLE_MAX = 170, PAN_DIR = +1, TILT_DIR = +1;
 const int STALL_CYCLES = 40, PARK_PAN = ANGLE_MIN, PARK_TILT = 60;
 const unsigned long DRAW_EVERY = 400;
 
-// --- dials the phone can change while running (start values) ---
-int deadzone = 60;   // how lopsided the light must be before moving
-int stepDeg = 1;     // degrees per nudge
-int darkLevel = 350; // average reading below this counts as night
-int smoothPct = 30;  // sensor smoothing, percent (lower = calmer)
-int fixedPan = 90;   // the flat hold angles used in the Fixed test
+// Runtime-adjustable parameters (variables, not const) so they can be changed live
+// from the dashboard. The values below are the startup defaults.
+int deadzone = 60;   // minimum light difference required before the panel moves
+int stepDeg = 1;     // degrees moved per loop (smaller = smoother)
+int darkLevel = 350; // average reading below this is treated as night
+int smoothPct = 30;  // sensor smoothing strength, percent (lower = calmer)
+int fixedPan = 90;   // hold angles used during the fixed-panel comparison
 int fixedTilt = 90;
 
-// --- modes the user can pick from the phone ---
+// Operating modes. AUTO follows the sun, FIXEDMODE holds the panel flat for
+// comparison, MANUAL applies servo positions sent from the dashboard.
 enum Mode
 {
   AUTO,
@@ -62,22 +76,26 @@ enum Mode
   MANUAL
 };
 Mode mode = AUTO;
-int manualPan = 90, manualTilt = 90; // angles set by the phone in Manual mode
-bool isNight = false;
-const char *stateLabel = "TRACKING";
+int manualPan = 90, manualTilt = 90; // target angles set by the dashboard in MANUAL
+bool isNight = false;                // set true when AUTO detects darkness
+const char *stateLabel = "TRACKING"; // text shown on the screen and dashboard
 
-// --- live values ---
+// Values updated every loop. Each sensor is kept in two forms: the raw pin reading
+// and a smoothed value. Steering uses the smoothed values to avoid jitter.
 int panAngle = 90, tiltAngle = 90;
-int rawTL, rawTR, rawBL, rawBR;
-float tl = 0, tr = 0, bl = 0, br = 0;
+int rawTL, rawTR, rawBL, rawBR;       // raw pin readings
+float tl = 0, tr = 0, bl = 0, br = 0; // smoothed readings (used for steering)
 int hErr, vErr, panStall = 0, tiltStall = 0;
 bool panStalled = false, tiltStalled = false;
 
-// --- power and the two comparison buckets ---
+// Power readings and the two comparison buckets. Energy accumulates into the bucket
+// matching the active mode; the elapsed-time totals allow average power (and the
+// percentage gain of tracking over fixed) to be calculated.
 float busV = 0, current_mA = 0, power_mW = 0;
 double energyTrack_mWh = 0, energyFixed_mWh = 0, msTrack = 0, msFixed = 0;
 unsigned long lastEnergyMs = 0, lastDrawMs = 0;
 
+// Function prototypes (definitions appear below).
 void readSensors();
 void updateDisplay();
 uint16_t stateColor();
@@ -90,7 +108,10 @@ void handleMove();
 void handleSet();
 void handleReset();
 
-// the control-panel page, stored in the chip so it needs no internet
+// Web dashboard (HTML, CSS, and JavaScript) stored as a single text block in flash
+// and served directly from the device, so it works without internet access. The
+// script polls /data once per second to refresh the readings and graph, and sends
+// requests to /mode, /move, /set, and /reset when the controls are used.
 const char PAGE[] = R"HTML(
 <!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>Solar Tracker</title>
@@ -203,13 +224,16 @@ setInterval(tick,1000);tick();
 
 void setup()
 {
-  Serial.begin(115200);
-  analogReadResolution(12);
+  Serial.begin(115200);     // serial output for debugging
+  analogReadResolution(12); // 12-bit ADC range (0-4095)
   pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH);
-  Wire.begin();
+  digitalWrite(TFT_BL, HIGH); // enable display backlight
+
+  Wire.begin(); // start I2C for the INA219
   if (!ina219.begin())
-    Serial.println("INA219 not found");
+    Serial.println("INA219 not found"); // report a wiring fault
+
+  // initialise the display and show a splash with the connection details
   tft.initR(INITR_BLACKTAB);
   tft.setRotation(3);
   tft.fillScreen(ST77XX_BLACK);
@@ -225,6 +249,7 @@ void setup()
   tft.setCursor(8, 70);
   tft.print("http://192.168.4.1");
 
+  // reserve PWM timers, attach the servos, and centre them
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
@@ -236,24 +261,28 @@ void setup()
   panServo.write(panAngle);
   tiltServo.write(tiltAngle);
 
+  // start the access point and map each URL to its handler
   WiFi.softAP(AP_SSID, AP_PASS);
-  server.on("/", handleRoot);
-  server.on("/data", handleData);
-  server.on("/mode", handleMode);   // Auto / Fixed / Manual buttons
-  server.on("/move", handleMove);   // manual pan/tilt sliders
-  server.on("/set", handleSet);     // live tuning sliders
-  server.on("/reset", handleReset); // clear the comparison
+  server.on("/", handleRoot);       // serves the dashboard page
+  server.on("/data", handleData);   // returns live values as JSON
+  server.on("/mode", handleMode);   // mode selection (Auto/Fixed/Manual)
+  server.on("/move", handleMove);   // manual servo positions
+  server.on("/set", handleSet);     // live tuning values
+  server.on("/reset", handleReset); // clears the comparison
   server.begin();
 
-  lastEnergyMs = millis();
+  lastEnergyMs = millis(); // initialise the energy timing reference
   delay(1200);
 }
 
 void loop()
 {
+  // Step 1: read and smooth the sensors, then compute overall brightness for day/night detection.
   readSensors();
   float avg = (tl + tr + bl + br) / 4.0;
 
+  // Step 2: read the panel and accumulate energy (power x elapsed time) into the bucket
+  // for the active mode. Manual mode is excluded from the comparison.
   busV = ina219.getBusVoltage_V();
   current_mA = ina219.getCurrent_mA();
   power_mW = ina219.getPower_mW();
@@ -263,7 +292,6 @@ void loop()
   unsigned long now = millis();
   double dms = now - lastEnergyMs;
   lastEnergyMs = now;
-  // bank energy only in the two comparison modes (manual is excluded)
   if (mode == AUTO)
   {
     energyTrack_mWh += power_mW * (dms / 3600000.0);
@@ -275,9 +303,11 @@ void loop()
     msFixed += dms;
   }
 
+  // Step 3: select the state and act on it.
   isNight = false;
   if (mode == MANUAL)
   {
+    // apply the dashboard-set angles directly
     panAngle = manualPan;
     tiltAngle = manualTilt;
     stateLabel = "MANUAL";
@@ -285,6 +315,7 @@ void loop()
   }
   else if (mode == FIXEDMODE)
   {
+    // hold the panel flat as the fixed reference
     panAngle = fixedPan;
     tiltAngle = fixedTilt;
     stateLabel = "FIXED";
@@ -294,6 +325,7 @@ void loop()
   { // AUTO
     if (avg < darkLevel)
     {
+      // too dark to track: park aimed east and low, ready for sunrise
       panAngle = PARK_PAN;
       tiltAngle = PARK_TILT;
       stateLabel = "NIGHT";
@@ -302,11 +334,15 @@ void loop()
     }
     else
     {
+      // tracking: steer toward the brighter side on each axis
       stateLabel = "TRACKING";
-      hErr = ((tl + bl) / 2) - ((tr + br) / 2);
-      vErr = ((tl + tr) / 2) - ((bl + br) / 2);
+      hErr = ((tl + bl) / 2) - ((tr + br) / 2); // left minus right
+      vErr = ((tl + tr) / 2) - ((bl + br) / 2); // top minus bottom
+      // move only when the difference exceeds the deadzone, otherwise hold to avoid jitter
       int panNudge = (abs(hErr) > deadzone) ? PAN_DIR * ((hErr > 0) ? stepDeg : -stepDeg) : 0;
       int tiltNudge = (abs(vErr) > deadzone) ? TILT_DIR * ((vErr > 0) ? stepDeg : -stepDeg) : 0;
+      // stall guard: cancel a nudge that would push further past a reached limit, and flag a
+      // sustained stall so the dashboard can report it
       if ((panAngle >= ANGLE_MAX && panNudge > 0) || (panAngle <= ANGLE_MIN && panNudge < 0))
       {
         if (++panStall > STALL_CYCLES)
@@ -329,23 +365,27 @@ void loop()
         tiltStall = 0;
         tiltStalled = false;
       }
+      // apply the nudge, constrained to the safe angle range
       panAngle = constrain(panAngle + panNudge, ANGLE_MIN, ANGLE_MAX);
       tiltAngle = constrain(tiltAngle + tiltNudge, ANGLE_MIN, ANGLE_MAX);
     }
   }
 
   panServo.write(panAngle);
-  tiltServo.write(tiltAngle);
+  tiltServo.write(tiltAngle); // output the final angles
 
+  // Step 4: refresh the display on its interval and service any web client.
   if (now - lastDrawMs >= DRAW_EVERY)
   {
     updateDisplay();
     lastDrawMs = now;
   }
   server.handleClient();
-  delay(SETTLE_MS);
+  delay(SETTLE_MS); // allow time for servo movement
 }
 
+// Reads the four sensors and eases each smoothed value toward its new reading.
+// This exponential smoothing averages out noise; smoothPct sets the step size.
 void readSensors()
 {
   rawTL = analogRead(PIN_TL);
@@ -359,6 +399,7 @@ void readSensors()
   br += (rawBR - br) * a;
 }
 
+// Returns the badge colour matching the current state.
 uint16_t stateColor()
 {
   if (mode == MANUAL)
@@ -367,11 +408,15 @@ uint16_t stateColor()
     return 0xFD20; // amber
   if (isNight)
     return 0x5BDF; // blue
-  return 0x07E0;   // green = tracking
+  return 0x07E0;   // green = actively tracking
 }
+
+// Returns the mode as the text tag used by the dashboard.
 const char *modeName() { return mode == AUTO ? "auto" : mode == FIXEDMODE ? "fixed"
                                                                           : "manual"; }
 
+// Returns the percentage gain of tracking over fixed. Average power per mode is
+// energy divided by run time; returns 0 until a fixed-mode sample exists.
 float gainPct()
 {
   double hT = msTrack / 3600000.0, hF = msFixed / 3600000.0;
@@ -380,10 +425,12 @@ float gainPct()
   return pF > 0 ? (float)((pT - pF) / pF * 100.0) : 0;
 }
 
+// Draws the status board on the TFT.
 void updateDisplay()
 {
   uint16_t col = stateColor();
   tft.fillScreen(ST77XX_BLACK);
+  // title and state badge
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_YELLOW);
   tft.setCursor(4, 2);
@@ -393,7 +440,7 @@ void updateDisplay()
   tft.setTextColor(ST77XX_BLACK);
   tft.setCursor(97, 6);
   tft.print(stateLabel);
-
+  // live power
   tft.setTextColor(0x7BEF);
   tft.setCursor(4, 26);
   tft.print("POWER");
@@ -403,7 +450,7 @@ void updateDisplay()
   tft.print(power_mW, 1);
   tft.setTextSize(1);
   tft.print(" mW");
-
+  // voltage and current angles
   int y = 60;
   tft.setTextColor(0x7BEF);
   tft.setCursor(4, y);
@@ -420,7 +467,7 @@ void updateDisplay()
   tft.print(panAngle);
   tft.print("/");
   tft.print(tiltAngle);
-
+  // energy totals and gain
   y = 80;
   tft.setTextColor(0x7BEF);
   tft.setCursor(4, y);
@@ -441,7 +488,7 @@ void updateDisplay()
   tft.setCursor(46, y + 24);
   tft.print(gainPct(), 1);
   tft.print("%");
-
+  // connection footer
   tft.setTextColor(0x5BDF);
   tft.setCursor(4, 120);
   tft.print("WiFi ");
@@ -449,9 +496,12 @@ void updateDisplay()
   tft.print(" .4.1");
 }
 
-// --- web handlers ---
+// --- Web handlers (each runs when the matching URL is requested) ---
+
+// Serves the dashboard page.
 void handleRoot() { server.send(200, "text/html", PAGE); }
 
+// Returns all current values as a single JSON object; polled once per second.
 void handleData()
 {
   double hT = msTrack / 3600000.0, hF = msFixed / 3600000.0;
@@ -470,6 +520,8 @@ void handleData()
   server.send(200, "application/json", buf);
 }
 
+// Sets the operating mode. Switching to Manual seeds the manual targets with the
+// current angles to prevent a jump.
 void handleMode()
 {
   String m = server.arg("m");
@@ -486,6 +538,7 @@ void handleMode()
   server.send(200, "text/plain", "ok");
 }
 
+// Stores manual servo positions, constrained to the safe range.
 void handleMove()
 {
   if (server.hasArg("pan"))
@@ -495,6 +548,8 @@ void handleMove()
   server.send(200, "text/plain", "ok");
 }
 
+// Updates one tuning parameter: "k" selects the field, "v" is the value. Each value
+// is constrained to a valid range.
 void handleSet()
 {
   String k = server.arg("k");
@@ -514,6 +569,7 @@ void handleSet()
   server.send(200, "text/plain", "ok");
 }
 
+// Clears both energy buckets to restart the comparison.
 void handleReset()
 {
   energyTrack_mWh = 0;
