@@ -224,7 +224,10 @@ setInterval(tick,1000);tick();
 
 void setup()
 {
-  Serial.begin(115200);     // serial output for debugging
+  Serial.begin(115200); // serial output for debugging
+  delay(3000);
+
+  Serial.println("Booting up...");
   analogReadResolution(12); // 12-bit ADC range (0-4095)
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH); // enable display backlight
