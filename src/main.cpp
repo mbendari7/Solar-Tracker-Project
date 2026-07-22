@@ -13,7 +13,7 @@
     sensors TL/TR/BL/BR -> A0/A1/A2/A3   (3.3 V reference)
     pan servo -> D2   tilt servo -> D3   (5 V supply, common ground)
     INA219  SDA -> A4   SCL -> A5         (I2C)
-    ST7735  SCK -> D13  MOSI -> D11  CS -> D10  DC -> D9  RES -> D8  BL -> 3V3  (SPI)
+    ST7735  SCK -> D13  MOSI -> D11  CS -> D10  DC -> D9  RES -> D8  BL -> D7   (SPI)
 
   Access: connect to WiFi network "SolarTracker" (password track1234),
   then open http://192.168.4.1
@@ -273,6 +273,7 @@ void setup()
   server.on("/set", handleSet);     // live tuning values
   server.on("/reset", handleReset); // clears the comparison
   server.begin();
+  layoutDrawn = false; // dashboard layout draws once on the first refresh
 
   lastEnergyMs = millis(); // initialise the energy timing reference
   delay(1200);
@@ -428,75 +429,82 @@ float gainPct()
   return pF > 0 ? (float)((pT - pF) / pF * 100.0) : 0;
 }
 
-// Draws the status board on the TFT.
-void updateDisplay()
+// Draws the status board on the TFT without flicker: the static layout is drawn
+// once, then each refresh only overwrites the changing values. Text is printed
+// with an explicit background colour so old digits are erased in place --
+// no full-screen wipe, so the display no longer flashes every refresh.
+bool layoutDrawn = false;
+
+void drawLayout()
 {
-  uint16_t col = stateColor();
   tft.fillScreen(ST77XX_BLACK);
-  // title and state badge
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_YELLOW);
   tft.setCursor(4, 2);
   tft.print("SOLAR");
-  tft.fillRoundRect(92, 2, 64, 16, 3, col);
   tft.setTextSize(1);
-  tft.setTextColor(ST77XX_BLACK);
-  tft.setCursor(97, 6);
-  tft.print(stateLabel);
-  // live power
   tft.setTextColor(0x7BEF);
   tft.setCursor(4, 26);
   tft.print("POWER");
-  tft.setTextSize(2);
-  tft.setTextColor(ST77XX_GREEN);
-  tft.setCursor(4, 36);
-  tft.print(power_mW, 1);
-  tft.setTextSize(1);
-  tft.print(" mW");
-  // voltage and current angles
-  int y = 60;
   tft.setTextColor(0x7BEF);
-  tft.setCursor(4, y);
+  tft.setCursor(4, 60);
   tft.print("Volt");
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(40, y);
-  tft.print(busV, 2);
-  tft.print("V");
-  tft.setTextColor(0x7BEF);
-  tft.setCursor(92, y);
+  tft.setCursor(92, 60);
   tft.print("P/T");
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(116, y);
-  tft.print(panAngle);
-  tft.print("/");
-  tft.print(tiltAngle);
-  // energy totals and gain
-  y = 80;
-  tft.setTextColor(0x7BEF);
-  tft.setCursor(4, y);
+  tft.setCursor(4, 80);
   tft.print("E trk");
-  tft.setTextColor(ST77XX_CYAN);
-  tft.setCursor(46, y);
-  tft.print(energyTrack_mWh, 2);
-  tft.setTextColor(0x7BEF);
-  tft.setCursor(4, y + 12);
+  tft.setCursor(4, 92);
   tft.print("E fix");
-  tft.setTextColor(ST77XX_CYAN);
-  tft.setCursor(46, y + 12);
-  tft.print(energyFixed_mWh, 2);
-  tft.setTextColor(0x7BEF);
-  tft.setCursor(4, y + 24);
+  tft.setCursor(4, 104);
   tft.print("Gain");
-  tft.setTextColor(0xFD20);
-  tft.setCursor(46, y + 24);
-  tft.print(gainPct(), 1);
-  tft.print("%");
-  // connection footer
   tft.setTextColor(0x5BDF);
   tft.setCursor(4, 120);
   tft.print("WiFi ");
   tft.print(AP_SSID);
   tft.print(" .4.1");
+  layoutDrawn = true;
+}
+
+void updateDisplay()
+{
+  if (!layoutDrawn)
+    drawLayout();
+  uint16_t col = stateColor();
+  // state badge (redrawn each time -- small, no visible flash)
+  tft.fillRoundRect(92, 2, 64, 16, 3, col);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setCursor(97, 6);
+  tft.print(stateLabel);
+  // live power: black background colour erases the previous digits in place
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+  tft.setCursor(4, 36);
+  tft.print(power_mW, 1);
+  tft.setTextSize(1);
+  tft.print(" mW   ");
+  // voltage and pan/tilt angles
+  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+  tft.setCursor(40, 60);
+  tft.print(busV, 2);
+  tft.print("V  ");
+  tft.setCursor(116, 60);
+  tft.print(panAngle);
+  tft.print("/");
+  tft.print(tiltAngle);
+  tft.print("  ");
+  // energy totals and gain
+  tft.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+  tft.setCursor(46, 80);
+  tft.print(energyTrack_mWh, 2);
+  tft.print("  ");
+  tft.setCursor(46, 92);
+  tft.print(energyFixed_mWh, 2);
+  tft.print("  ");
+  tft.setTextColor(0xFD20, ST77XX_BLACK);
+  tft.setCursor(46, 104);
+  tft.print(gainPct(), 1);
+  tft.print("%  ");
 }
 
 // --- Web handlers (each runs when the matching URL is requested) ---
