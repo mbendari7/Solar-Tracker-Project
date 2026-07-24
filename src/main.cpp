@@ -21,6 +21,7 @@
 
 // Hardware and networking libraries. WiFi and WebServer are part of the ESP32 core
 // and require no separate installation.
+#include <string.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
@@ -39,6 +40,9 @@ const int PAN_PIN = D2, TILT_PIN = D3;
 #define TFT_DC D9
 #define TFT_RST D8
 #define TFT_BL D7
+// Display controller variant. If the screen shows a picture but the colours are
+// wrong or the image is shifted, change this to INITR_GREENTAB or INITR_REDTAB.
+#define TFT_TAB INITR_BLACKTAB
 
 // Hardware interface objects for the display, power sensor, and two servos.
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
@@ -57,6 +61,7 @@ WebServer server(80);
 const int SETTLE_MS = 20, ANGLE_MIN = 10, ANGLE_MAX = 170, PAN_DIR = +1, TILT_DIR = +1;
 const int STALL_CYCLES = 40, PARK_PAN = ANGLE_MIN, PARK_TILT = 60;
 const unsigned long DRAW_EVERY = 400;
+const unsigned long SERIAL_EVERY = 1000; // status line interval on the serial monitor
 
 // Runtime-adjustable parameters (variables, not const) so they can be changed live
 // from the dashboard. The values below are the startup defaults.
@@ -92,12 +97,19 @@ bool panStalled = false, tiltStalled = false;
 // matching the active mode; the elapsed-time totals allow average power (and the
 // percentage gain of tracking over fixed) to be calculated.
 float busV = 0, current_mA = 0, power_mW = 0;
+bool inaOK = false;          // true only when the INA219 answered on the I2C bus
+char i2cList[64] = "";       // addresses found on the I2C bus, shown on the dashboard
+bool servosAttached = false; // true if both servo objects attached successfully
 double energyTrack_mWh = 0, energyFixed_mWh = 0, msTrack = 0, msFixed = 0;
-unsigned long lastEnergyMs = 0, lastDrawMs = 0;
+unsigned long lastEnergyMs = 0, lastDrawMs = 0, lastSerialMs = 0;
+bool layoutDrawn = false; // false = redraw the static screen layout on the next refresh
 
 // Function prototypes (definitions appear below).
 void readSensors();
 void updateDisplay();
+void i2cScan();
+void serialStatus();
+void drawLayout();
 uint16_t stateColor();
 float gainPct();
 const char *modeName();
@@ -107,6 +119,7 @@ void handleMode();
 void handleMove();
 void handleSet();
 void handleReset();
+void handleServoTest();
 
 // Web dashboard (HTML, CSS, and JavaScript) stored as a single text block in flash
 // and served directly from the device, so it works without internet access. The
@@ -168,6 +181,12 @@ input[type=range]{width:100%;accent-color:#39d98a}
 <div class=row><span class=k>Pan / Tilt</span><span class=v id=ang>--</span></div>
 <div class=row><span class=k>Sensors TL TR BL BR</span><span class=v id=sens>--</span></div></div>
 
+<div class=card><div class=label>Diagnostics</div>
+<div class=row><span class=k>I2C devices found</span><span class=v id=i2c>--</span></div>
+<div class=row><span class=k>INA219</span><span class=v id=ina>--</span></div>
+<div class=row><span class=k>Servos attached</span><span class=v id=sv>--</span></div>
+<button class=btn onclick="servoTest()">Test servos now (forced sweep)</button></div>
+
 <div class=card><div class=label>Tuning (live)</div>
 <div class=slider><div class=top><span class=k>Deadzone</span><span id=dzL>--</span></div>
 <input type=range id=dz min=5 max=300 oninput="setv('deadzone','dz','dzL','')"></div>
@@ -195,6 +214,9 @@ $('eT').textContent=d.eTrack.toFixed(2)+' mWh';$('eF').textContent=d.eFixed.toFi
 $('state').textContent=d.state+(d.stall?'  (stall)':'');
 $('volts').textContent=d.volts.toFixed(2)+' V';$('ang').textContent=d.pan+'\u00b0 / '+d.tilt+'\u00b0';
 $('sens').textContent=d.s.join('  ');
+$('i2c').textContent=d.i2c;
+$('ina').textContent=d.ina?'FOUND':'NOT FOUND';$('ina').style.color=d.ina?'#39d98a':'#ff6b6b';
+$('sv').textContent=d.sv?'yes':'NO';$('sv').style.color=d.sv?'#39d98a':'#ff6b6b';
 ['mAuto','mFixed','mManual'].forEach(x=>$(x).classList.remove('on'));
 $({auto:'mAuto',fixed:'mFixed',manual:'mManual'}[d.mode]).classList.add('on');
 $('manual').classList.toggle('hide',d.mode!='manual');
@@ -218,6 +240,7 @@ function move(){let p=$('mp').value,t=$('mt').value;
  $('mpL').innerHTML=p+'&deg;';$('mtL').innerHTML=t+'&deg;';fetch('/move?pan='+p+'&tilt='+t);}
 function setv(key,sid,lid,suf){let v=$(sid).value;$(lid).innerHTML=v+suf;fetch('/set?k='+key+'&v='+v);}
 function reset(){fetch('/reset');}
+function servoTest(){fetch('/servotest');}
 setInterval(tick,1000);tick();
 </script></body></html>
 )HTML";
@@ -233,12 +256,32 @@ void setup()
   digitalWrite(TFT_BL, HIGH); // enable display backlight
 
   Wire.begin(); // start I2C for the INA219
-  if (!ina219.begin())
-    Serial.println("INA219 not found"); // report a wiring fault
+  i2cScan();    // list every device answering, so a wiring fault is obvious
+  inaOK = ina219.begin();
+  if (inaOK)
+  {
+    // The library defaults to its widest range (32 V / 2 A), where the power
+    // reading moves in 2 mW steps -- small panel outputs round down to zero.
+    // This narrower range resolves roughly 1 mW and doubles current resolution.
+    ina219.setCalibration_16V_400mA();
+    Serial.println("INA219 ready (16V / 400mA range)");
+  }
+  else
+    Serial.println("INA219 NOT FOUND -- check SDA on A4, SCL on A5, VCC on 3.3V");
 
   // initialise the display and show a splash with the connection details
-  tft.initR(INITR_BLACKTAB);
+  tft.initR(TFT_TAB);
   tft.setRotation(3);
+  // Comms check: these three flashes prove the display is receiving data.
+  // If the screen stays white through all of them it is powered but not
+  // listening -- check SDA on D11, SCL on D13, CS on D10, DC on D9, RES on D8.
+  Serial.println("Display test: red, green, blue...");
+  tft.fillScreen(ST77XX_RED);
+  delay(350);
+  tft.fillScreen(ST77XX_GREEN);
+  delay(350);
+  tft.fillScreen(ST77XX_BLUE);
+  delay(350);
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextColor(ST77XX_YELLOW);
   tft.setTextSize(2);
@@ -261,17 +304,20 @@ void setup()
   tiltServo.setPeriodHertz(50);
   panServo.attach(PAN_PIN, 500, 2400);
   tiltServo.attach(TILT_PIN, 500, 2400);
+  servosAttached = panServo.attached() && tiltServo.attached();
+  Serial.println(servosAttached ? "Servos attached" : "SERVO ATTACH FAILED");
   panServo.write(panAngle);
   tiltServo.write(tiltAngle);
 
   // start the access point and map each URL to its handler
   WiFi.softAP(AP_SSID, AP_PASS);
-  server.on("/", handleRoot);       // serves the dashboard page
-  server.on("/data", handleData);   // returns live values as JSON
-  server.on("/mode", handleMode);   // mode selection (Auto/Fixed/Manual)
-  server.on("/move", handleMove);   // manual servo positions
-  server.on("/set", handleSet);     // live tuning values
-  server.on("/reset", handleReset); // clears the comparison
+  server.on("/", handleRoot);               // serves the dashboard page
+  server.on("/data", handleData);           // returns live values as JSON
+  server.on("/mode", handleMode);           // mode selection (Auto/Fixed/Manual)
+  server.on("/move", handleMove);           // manual servo positions
+  server.on("/set", handleSet);             // live tuning values
+  server.on("/reset", handleReset);         // clears the comparison
+  server.on("/servotest", handleServoTest); // forced servo sweep, ignores mode
   server.begin();
   layoutDrawn = false; // dashboard layout draws once on the first refresh
 
@@ -287,11 +333,14 @@ void loop()
 
   // Step 2: read the panel and accumulate energy (power x elapsed time) into the bucket
   // for the active mode. Manual mode is excluded from the comparison.
-  busV = ina219.getBusVoltage_V();
-  current_mA = ina219.getCurrent_mA();
-  power_mW = ina219.getPower_mW();
-  if (power_mW < 0)
-    power_mW = 0;
+  if (inaOK)
+  {
+    busV = ina219.getBusVoltage_V();
+    current_mA = ina219.getCurrent_mA();
+    power_mW = ina219.getPower_mW();
+    if (power_mW < 0)
+      power_mW = 0;
+  }
 
   unsigned long now = millis();
   double dms = now - lastEnergyMs;
@@ -384,8 +433,80 @@ void loop()
     updateDisplay();
     lastDrawMs = now;
   }
+  if (now - lastSerialMs >= SERIAL_EVERY)
+  {
+    serialStatus();
+    lastSerialMs = now;
+  }
   server.handleClient();
   delay(SETTLE_MS); // allow time for servo movement
+}
+
+// Lists every device that answers on the I2C bus. The INA219 normally appears
+// at 0x40. An empty list means the bus is not wired or not powered.
+void i2cScan()
+{
+  Serial.println("I2C scan:");
+  int found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++)
+  {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0)
+    {
+      Serial.print("  device at 0x");
+      Serial.println(addr, HEX);
+      char one[10];
+      snprintf(one, sizeof(one), "%s0x%02X", found ? " " : "", addr);
+      strncat(i2cList, one, sizeof(i2cList) - strlen(i2cList) - 1);
+      found++;
+    }
+  }
+  if (found == 0)
+  {
+    Serial.println("  no devices on the bus");
+    snprintf(i2cList, sizeof(i2cList), "none");
+  }
+}
+
+// One status line per second covering every subsystem. hErr and vErr are the
+// left/right and top/bottom light differences; the panel only moves when one of
+// them exceeds the deadzone, so comparing them here explains a stationary panel.
+void serialStatus()
+{
+  Serial.print("sensors ");
+  Serial.print(rawTL);
+  Serial.print(" ");
+  Serial.print(rawTR);
+  Serial.print(" ");
+  Serial.print(rawBL);
+  Serial.print(" ");
+  Serial.print(rawBR);
+  Serial.print(" | hErr ");
+  Serial.print(hErr);
+  Serial.print(" vErr ");
+  Serial.print(vErr);
+  Serial.print(" deadzone ");
+  Serial.print(deadzone);
+  Serial.print(" | pan ");
+  Serial.print(panAngle);
+  Serial.print(" tilt ");
+  Serial.print(tiltAngle);
+  Serial.print(" | ");
+  if (inaOK)
+  {
+    Serial.print(busV, 2);
+    Serial.print("V ");
+    Serial.print(current_mA, 2);
+    Serial.print("mA ");
+    Serial.print(power_mW, 2);
+    Serial.print("mW");
+  }
+  else
+    Serial.print("INA219 offline");
+  Serial.print(" | ");
+  Serial.print(stateLabel);
+  Serial.print(" / ");
+  Serial.println(modeName());
 }
 
 // Reads the four sensors and eases each smoothed value toward its new reading.
@@ -433,8 +554,6 @@ float gainPct()
 // once, then each refresh only overwrites the changing values. Text is printed
 // with an explicit background colour so old digits are erased in place --
 // no full-screen wipe, so the display no longer flashes every refresh.
-bool layoutDrawn = false;
-
 void drawLayout()
 {
   tft.fillScreen(ST77XX_BLACK);
@@ -518,16 +637,18 @@ void handleData()
   double hT = msTrack / 3600000.0, hF = msFixed / 3600000.0;
   double pT = hT > 0 ? energyTrack_mWh / hT : 0;
   double pF = hF > 0 ? energyFixed_mWh / hF : 0;
-  char buf[620];
+  char buf[760];
   snprintf(buf, sizeof(buf),
            "{\"power\":%.1f,\"volts\":%.2f,\"pan\":%d,\"tilt\":%d,"
            "\"eTrack\":%.3f,\"eFixed\":%.3f,\"pTrack\":%.1f,\"pFixed\":%.1f,\"gain\":%.1f,"
            "\"s\":[%d,%d,%d,%d],\"state\":\"%s\",\"mode\":\"%s\",\"stall\":%s,"
-           "\"deadzone\":%d,\"step\":%d,\"smooth\":%d,\"dark\":%d,\"fpan\":%d,\"ftilt\":%d}",
+           "\"deadzone\":%d,\"step\":%d,\"smooth\":%d,\"dark\":%d,\"fpan\":%d,\"ftilt\":%d,"
+           "\"i2c\":\"%s\",\"ina\":%s,\"sv\":%s}",
            power_mW, busV, panAngle, tiltAngle, energyTrack_mWh, energyFixed_mWh, pT, pF, gainPct(),
            rawTL, rawTR, rawBL, rawBR, stateLabel, modeName(),
            (panStalled || tiltStalled) ? "true" : "false",
-           deadzone, stepDeg, smoothPct, darkLevel, fixedPan, fixedTilt);
+           deadzone, stepDeg, smoothPct, darkLevel, fixedPan, fixedTilt,
+           i2cList, inaOK ? "true" : "false", servosAttached ? "true" : "false");
   server.send(200, "application/json", buf);
 }
 
@@ -578,6 +699,28 @@ void handleSet()
   else if (k == "ftilt")
     fixedTilt = constrain(v, ANGLE_MIN, ANGLE_MAX);
   server.send(200, "text/plain", "ok");
+}
+
+// Forced servo sweep for testing. Runs immediately regardless of the active mode,
+// so it proves whether the servos and their power supply work at all.
+void handleServoTest()
+{
+  server.send(200, "text/plain", "sweeping");
+  for (int a = 60; a <= 120; a += 2)
+  {
+    panServo.write(a);
+    tiltServo.write(a);
+    delay(20);
+  }
+  for (int a = 120; a >= 60; a -= 2)
+  {
+    panServo.write(a);
+    tiltServo.write(a);
+    delay(20);
+  }
+  panServo.write(90);
+  tiltServo.write(90);
+  manualPan = manualTilt = 90;
 }
 
 // Clears both energy buckets to restart the comparison.
